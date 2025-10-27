@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import pytz
 import io
 import os
@@ -58,45 +58,76 @@ def to_american_odds(odds_value):
 
 
 # --------------------------------------------------------
-# Core logic: Fetch odds
+# Step 1 – Fetch upcoming NFL games (for selection)
 # --------------------------------------------------------
-def fetch_odds():
+def get_upcoming_games():
     API_KEY = load_api_key()
     events_url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/events?apiKey={API_KEY}&regions={REGION}"
+
     try:
-        events_resp = requests.get(events_url)
-        events_resp.raise_for_status()
+        events_resp = requests.get(events_url, timeout=15)
+    except requests.exceptions.RequestException as e:
+        st.error(f"🌐 Network error: {e}")
+        return []
+
+    if events_resp.status_code != 200:
+        try:
+            err_json = events_resp.json()
+            err_message = err_json.get("message", "Unknown API error")
+        except Exception:
+            err_message = events_resp.text
+        st.error(f"❌ API error {events_resp.status_code}: {err_message}")
+        return []
+
+    try:
         events = events_resp.json()
     except Exception as e:
-        st.error(f"❌ Failed to fetch events: {e}")
-        return pd.DataFrame()
+        st.error(f"⚠️ Failed to parse API response: {e}")
+        return []
 
-    now = datetime.utcnow()
-    time_limit = now + timedelta(hours=HOURS_AHEAD)
-    upcoming_events = [
-        e for e in events
-        if datetime.fromisoformat(e["commence_time"].replace("Z", "")) <= time_limit
-    ]
-    if not upcoming_events:
-        st.warning("⚠️ No upcoming NFL games found in the next 48 hours.")
-        return pd.DataFrame()
-
-    all_props = []
+    now_utc = datetime.now(timezone.utc)
+    time_limit = now_utc + timedelta(hours=HOURS_AHEAD)
     eastern_tz = pytz.timezone("US/Eastern")
 
-    progress = st.progress(0)
-    for idx, event in enumerate(upcoming_events):
-        event_id = event["id"]
-        event_name = f"{event.get('home_team')} vs {event.get('away_team')}"
-        commence_time_utc = event.get("commence_time")
-
-        # Convert UTC → Eastern
+    games = []
+    for e in events:
         try:
-            utc_dt = datetime.fromisoformat(commence_time_utc.replace("Z", "+00:00"))
-            est_dt = utc_dt.astimezone(eastern_tz)
-            formatted_est = est_dt.strftime("%m-%d-%Y %H:%M")
-        except Exception:
-            formatted_est = "N/A"
+            # ✅ Parse kickoff time as UTC-aware
+            utc_dt = datetime.fromisoformat(e["commence_time"].replace("Z", "+00:00"))
+            utc_dt = utc_dt.replace(tzinfo=timezone.utc)
+
+            if utc_dt <= time_limit:
+                est_dt = utc_dt.astimezone(eastern_tz)
+                games.append({
+                    "id": e["id"],
+                    "game": f"{e['home_team']} vs {e['away_team']}",
+                    "date_est": est_dt.strftime("%m-%d-%Y"),
+                    "time_est": est_dt.strftime("%I:%M %p"),
+                    "datetime_est": est_dt.strftime("%m-%d-%Y %I:%M %p")
+                })
+        except Exception as ex:
+            print(f"Skipping event parse error: {ex}")
+            continue
+
+    if not games:
+        st.warning("⚠️ No upcoming NFL games found in the next 48 hours. (Time conversion fixed — check key or API limits.)")
+    return games
+
+
+# --------------------------------------------------------
+# Step 2 – Fetch odds only for selected games
+# --------------------------------------------------------
+def fetch_odds(selected_games):
+    API_KEY = load_api_key()
+    all_props = []
+
+    progress = st.progress(0)
+    for idx, game in enumerate(selected_games):
+        event_id = game["id"]
+        event_name = game["game"]
+        date_est = game["date_est"]
+        time_est = game["time_est"]
+        formatted_est = game["datetime_est"]
 
         odds_url = (
             f"https://api.the-odds-api.com/v4/sports/{SPORT}/events/{event_id}/odds/"
@@ -104,12 +135,19 @@ def fetch_odds():
         )
 
         try:
-            resp = requests.get(odds_url)
+            resp = requests.get(odds_url, timeout=15)
             if resp.status_code == 422:
                 continue
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                try:
+                    err_json = resp.json()
+                    st.warning(f"⚠️ API {resp.status_code} for {event_name}: {err_json.get('message','Unknown error')}")
+                except Exception:
+                    st.warning(f"⚠️ API {resp.status_code} for {event_name}: {resp.text}")
+                continue
             game_data = resp.json()
-        except Exception:
+        except requests.exceptions.RequestException as e:
+            st.warning(f"⚠️ Network error fetching {event_name}: {e}")
             continue
 
         for bookmaker in game_data.get("bookmakers", []):
@@ -124,6 +162,8 @@ def fetch_odds():
                     all_props.append({
                         "game": event_name,
                         "date_time_est": formatted_est,
+                        "date_est": date_est,
+                        "time_est": time_est,
                         "bookmaker": bookmaker.get("title"),
                         "market": market_key,
                         "player": outcome.get("description"),
@@ -132,11 +172,11 @@ def fetch_odds():
                         "odds_american": american_odds
                     })
 
-        progress.progress((idx + 1) / len(upcoming_events))
+        progress.progress((idx + 1) / len(selected_games))
 
     df = pd.DataFrame(all_props)
     if df.empty:
-        st.warning("⚠️ No FanDuel player prop odds available for selected markets.")
+        st.warning("⚠️ No FanDuel player prop odds available for selected games.")
         return pd.DataFrame()
 
     if "side" in df.columns:
@@ -149,22 +189,65 @@ def fetch_odds():
 # Streamlit UI
 # --------------------------------------------------------
 st.title("🏈 FanDuel NFL Player Prop Odds Fetcher")
-st.markdown("Fetch player prop odds for upcoming NFL games (FanDuel, next 48 hours).")
+st.markdown("Fetch player prop odds for **specific NFL games** from FanDuel within the next 48 hours.")
+st.divider()
+
+# Step 1: Show upcoming games
+st.header("📅 Select NFL Games to Fetch Odds For")
+games = get_upcoming_games()
+
+if not games:
+    st.stop()
+
+# Display list
+games_df = pd.DataFrame(games)
+st.dataframe(games_df[["game", "date_est", "time_est"]], use_container_width=True)
+
+# Let user pick
+selected_game_names = st.multiselect(
+    "Select one or more games:",
+    options=[g["game"] for g in games],
+    help="Choose which games you want to download odds for."
+)
+
+selected_games = [g for g in games if g["game"] in selected_game_names]
 
 st.divider()
 
-# Big button
-if st.button("🚀 **Get Odds**", use_container_width=True, type="primary"):
-    with st.spinner("Fetching latest FanDuel player prop odds..."):
-        df = fetch_odds()
+# Step 2: Fetch odds for selected
+if st.button("🚀 **Fetch FanDuel Odds for Selected Games**", use_container_width=True, type="primary"):
+    if not selected_games:
+        st.warning("⚠️ Please select at least one game before fetching odds.")
+        st.stop()
+
+    with st.spinner("Fetching FanDuel player prop odds..."):
+        df = fetch_odds(selected_games)
 
     if not df.empty:
-        st.success(f"✅ Retrieved {len(df)} odds entries.")
-        st.dataframe(df.head(20), use_container_width=True)
+        st.success(f"✅ Retrieved {len(df)} odds entries across {len(selected_games)} selected games.")
+        st.dataframe(df.head(25), use_container_width=True)
 
-        # Prepare CSV for download
         csv_buffer = io.StringIO()
         df.to_csv(csv_buffer, index=False)
+
+        # 🔴 Red styled download button
+        red_button_style = """
+        <style>
+        div[data-testid="stDownloadButton"] button {
+            background-color: #ff4b4b;
+            color: white;
+            font-weight: bold;
+            border-radius: 8px;
+            border: 1px solid #b30000;
+        }
+        div[data-testid="stDownloadButton"] button:hover {
+            background-color: #e60000;
+            border: 1px solid #660000;
+        }
+        </style>
+        """
+
+        st.markdown(red_button_style, unsafe_allow_html=True)
         st.download_button(
             label="⬇️ Download odds.csv",
             data=csv_buffer.getvalue(),
@@ -173,4 +256,4 @@ if st.button("🚀 **Get Odds**", use_container_width=True, type="primary"):
             use_container_width=True
         )
     else:
-        st.error("❌ No data returned. Try again later.")
+        st.error("❌ No data returned for the selected games.")
