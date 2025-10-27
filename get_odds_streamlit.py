@@ -23,6 +23,10 @@ MARKETS = [
     "player_receptions",
     "player_reception_yds",
     "player_rush_tds",
+    "player_pass_yds_alternate",
+    "player_receptions_alternate",
+    "player_reception_yds_alternate",
+    "player_rush_yds_alternate",
 ]
 
 # --------------------------------------------------------
